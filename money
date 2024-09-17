@@ -1,0 +1,175 @@
+#!/usr/bin/env bb
+
+;; TODO: Next steps
+;; - Store transactions in a sqlite database instead of outputting to csv
+;;   directly
+;; - Save a hash on each transaction to ensure we don't duplicate transactions
+;;   on csv import accidentally
+;; - Store configuration and custom mappings in a config file
+;; - Export data as csv from the sqlite database with custom ranges
+;;
+;; TODO: Later
+;; - Automatically pull from Monzo/Amex
+;; - "How long will it take us to save x given current trends?"
+;; - "Can I afford to buy something costing x?"
+;; - "How much budget do I have left for x?"
+
+(require
+ '[clojure.java.io :as io]
+ '[clojure.data.csv :as csv]
+ '[clojure.string :as str])
+
+;; **Category Mapping**
+(def category-mapping
+  {"" ""
+   "Bills" "Bills"
+
+   "Business Services-Health Care Services" "Personal care"
+   "Business Services-Other Services" ""
+   "Business Services-Printing & Publishing" ""
+   "Business Services-Professional Services" "Professional services"
+   "Communications-Internet Communication" "Internet"
+
+   "Eating out" "Eating out"
+   "Entertainment-Bars & Cafés" "Eating out"
+   "Entertainment-Clubs" "Entertainment"
+   "Entertainment-General Attractions" "Entertainment"
+   "Entertainment-Other Entertainment" "Entertainment"
+   "Entertainment-Restaurants" "Eating out"
+   "Entertainment" "Entertainment"
+
+   "General Purchases-Book Stores" ""
+   "General Purchases-Clothing Stores" ""
+   "General Purchases-Computer Supplies" ""
+   "General Purchases-Department Stores" ""
+   "General Purchases-Fuel" ""
+   "General Purchases-General Retail" ""
+   "General Purchases-Groceries" ""
+   "General Purchases-Hardware Supplies" ""
+   "General Purchases-Online Purchases" ""
+   "General Purchases-Parking Charges" ""
+   "General Purchases-Pharmacies" ""
+   "General Purchases-Sporting Goods Stores" ""
+
+   "General" "General"
+   "Groceries" "Groceries"
+   "Holidays" "Holidays"
+   "Income" "Income"
+   "Personal care" "Personal care"
+   "Savings" "Savings"
+   "Shopping" "Shopping"
+
+   "Transfers" "Transfers"
+
+   "Transport" "Transportation"
+   "Travel-Airline" "Transportation"
+   "Travel-Auto Services" "Transportation"
+   "Travel-Other Travel" "Transportation"
+   "Travel-Taxis & Coach" "Transportation"})
+
+;; **Function to Detect File Type Based on Headers**
+(defn detect-file-type [headers]
+  (let [header-set (set headers)]
+    (cond
+      (contains? header-set "Transaction ID") :monzo
+      (contains? header-set "Appears On Your Statement As") :amex
+      :else :unknown)))
+
+;; **Function to Normalize Date Strings to a Standard Format**
+(defn normalize-date [date-str]
+  (try
+    (let [formatter (java.time.format.DateTimeFormatter/ofPattern "dd/MM/yyyy")
+          parsed-date (java.time.LocalDate/parse date-str formatter)]
+      (.format parsed-date
+               (java.time.format.DateTimeFormatter/ofPattern "yyyy-MM-dd")))
+    (catch Exception e
+      (println "Warning: Failed to parse date:" date-str)
+      nil)))
+
+;; **Function to Map Categories with Fallback**
+(defn map-category [source-category]
+  (if-let [mapped-category (get category-mapping source-category)]
+    mapped-category
+    (str "[" source-category "]")))
+
+;; **Function to Process Monzo CSV Files**
+(defn process-monzo [rows]
+  (mapv (fn [row]
+          (let [money-in (get row "Money In")
+                money-out (get row "Money Out")
+                amount-str (or (not-empty money-in) (not-empty money-out))
+                amount (if amount-str (Double/parseDouble amount-str) 0.0)
+                ;; Map category with fallback
+                source-category (get row "Category")
+                mapped-category (map-category source-category)
+                date-str (get row "Date")
+                normalized-date (normalize-date date-str)]
+            {:date normalized-date
+             :amount amount
+             :name (get row "Name")
+             :category mapped-category
+             :account "monzo"}))
+        rows))
+
+;; **Function to Process Amex CSV Files**
+(defn process-amex [rows]
+  (mapv (fn [row]
+          (let [amount-str (get row "Amount")
+                amount (if (not-empty amount-str) (Double/parseDouble amount-str) 0.0)
+                amount (if (neg? amount) amount (- amount))
+                ;; Map category with fallback
+                source-category (get row "Category")
+                mapped-category (map-category source-category)
+                date-str (get row "Date")
+                normalized-date (normalize-date date-str)]
+            {:date normalized-date
+             :amount amount
+             :name (get row "Appears On Your Statement As")
+             :category mapped-category
+             :account "amex"}))
+        rows))
+
+;; **Main Processing Function**
+(defn process-file [file]
+  (with-open [reader (io/reader file)]
+    (let [data (doall (csv/read-csv reader))
+          headers (first data)
+          rows (doall (map #(zipmap headers %) (rest data)))
+          file-type (detect-file-type headers)
+          processed-data (case file-type
+                            :monzo (process-monzo rows)
+                            :amex (process-amex rows)
+                            (do
+                              (println "Unknown file type for file:" file)
+                              []))]
+      processed-data)))
+
+;; **Collect Data from All Input Files**
+(defn collect-data [files]
+  (doall (mapcat process-file files)))
+
+;; **Write Normalized Data to CSV**
+(defn write-csv [filename data]
+  (with-open [writer (io/writer filename)]
+    (let [headers ["Date" "Transaction Amount" "Name" "Category" "Account"]
+          sorted-data (sort-by :date data)
+          rows (mapv (fn [{:keys [date amount name category account]}]
+                       [date (format "%.2f" amount) name category account])
+                     sorted-data)]
+      (csv/write-csv writer [headers])
+      (csv/write-csv writer rows))))
+
+;; **Entry Point**
+(defn -main [& args]
+  (if (empty? args)
+    (println "Usage: script <input-file1> <input-file2> ...")
+    (let [files args
+          data (collect-data files)
+          today (.format (java.time.LocalDate/now)
+                         (java.time.format.DateTimeFormatter/ofPattern "yyyy-MM-dd"))
+          output-filename (str "normalized_expenses_" today ".csv")]
+      (write-csv output-filename data)
+      (println "Normalized data written to" output-filename))))
+
+;; **Invoke Main Function with Command-Line Arguments**
+(apply -main *command-line-args*)
