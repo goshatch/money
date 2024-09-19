@@ -1,0 +1,32 @@
+;; This file needs to be copied to $HOME/.config/money/config.edn
+{
+ :csv-types
+ [
+  {
+   :name "monzo"
+   :identifier-columns ["Transaction ID" "Date" "Time"]
+   :column-mappings {
+                     "Date" :date
+                     "Name" :name
+                     "Category" :original-category
+                     "Money Out" :amount
+                     "Money In" :amount
+                     }
+   }
+  {
+   :name "amex"
+   :identifier-columns ["Date" "Description" "Card Member"]
+   :column-mappings {
+                     "Date" :date
+                     "Appears On Your Statement As" :name
+                     "Category" :original-category
+                     "Amount" :amount
+                     }
+   }
+  ]
+ :category-rules
+ [
+  {:match {:name "Netflix" :amount 13.99} :category "Subscriptions"}
+  {:match {:original-category "Groceries"} :category "Groceries"}
+  ]
+ }

@@ -1,15 +1,22 @@
 #!/usr/bin/env bb
 
+;; Project goals:
+;; 1. Store bank/credit card transactions in a flexible format
+;;    instead of relying on crappy fintech apps and websites.
+;; 2. Create custom reports based on this data
+;; 3. ???
+;; 4. WEALTH AND PROFIT
+;;
 ;; TODO: Next steps
 ;; - Store transactions in a sqlite database instead of outputting to csv
 ;;   directly
 ;; - Save a hash on each transaction to ensure we don't duplicate transactions
 ;;   on csv import accidentally
 ;; - Store configuration and custom mappings in a config file
-;; - Export data as csv from the sqlite database with custom ranges
 ;;
 ;; TODO: Later
-;; - Automatically pull from Monzo/Amex
+;; - Export data as csv from the sqlite database with custom ranges
+;; - Automatically pull from Monzo/Amex/etc
 ;; - "How long will it take us to save x given current trends?"
 ;; - "Can I afford to buy something costing x?"
 ;; - "How much budget do I have left for x?"
@@ -17,65 +24,57 @@
 (require
  '[clojure.java.io :as io]
  '[clojure.data.csv :as csv]
- '[clojure.string :as str])
+ '[clojure.string :as str]
+ '[clojure.edn :as edn]
+ '[babashka.pods :as pods]
+ '[cheshire.core :as json])
 
-;; **Category Mapping**
-(def category-mapping
-  {"" ""
-   "Bills" "Bills"
+(pods/load-pod 'org.babashka/go-sqlite3 "0.2.4")
+(require '[pod.babashka.go-sqlite3 :as sqlite])
 
-   "Business Services-Health Care Services" "Personal care"
-   "Business Services-Other Services" ""
-   "Business Services-Printing & Publishing" ""
-   "Business Services-Professional Services" "Professional services"
-   "Communications-Internet Communication" "Internet"
+(pods/load-pod 'org.babashka/buddy "0.3.4")
+(require '[pod.babashka.buddy.core.hash :as hash])
 
-   "Eating out" "Eating out"
-   "Entertainment-Bars & Cafés" "Eating out"
-   "Entertainment-Clubs" "Entertainment"
-   "Entertainment-General Attractions" "Entertainment"
-   "Entertainment-Other Entertainment" "Entertainment"
-   "Entertainment-Restaurants" "Eating out"
-   "Entertainment" "Entertainment"
+(def config-path (str (System/getenv "HOME") "/.config/money/config.edn"))
 
-   "General Purchases-Book Stores" ""
-   "General Purchases-Clothing Stores" ""
-   "General Purchases-Computer Supplies" ""
-   "General Purchases-Department Stores" ""
-   "General Purchases-Fuel" ""
-   "General Purchases-General Retail" ""
-   "General Purchases-Groceries" ""
-   "General Purchases-Hardware Supplies" ""
-   "General Purchases-Online Purchases" ""
-   "General Purchases-Parking Charges" ""
-   "General Purchases-Pharmacies" ""
-   "General Purchases-Sporting Goods Stores" ""
+(def config
+  (if (.exists (io/file config-path))
+    (edn/read-string (slurp config-path))
+    (do
+      (println "Could not find config file at " config-path ", exiting.")
+      (System/exit 1))))
 
-   "General" "General"
-   "Groceries" "Groceries"
-   "Holidays" "Holidays"
-   "Income" "Income"
-   "Personal care" "Personal care"
-   "Savings" "Savings"
-   "Shopping" "Shopping"
+(def db-path (str (System/getenv "HOME") "/.local/money/transactions.db"))
+(def db-file (io/file db-path))
 
-   "Transfers" "Transfers"
+;; Backup database if it exists before doing any operations on it
+(when (.exists db-file)
+  (let [backup-path (str db-path "." (System/currentTimeMillis) ".bak")]
+    (io/copy db-file (io/file backup-path))
+    (println "Database backed up to " backup-path)))
 
-   "Transport" "Transportation"
-   "Travel-Airline" "Transportation"
-   "Travel-Auto Services" "Transportation"
-   "Travel-Other Travel" "Transportation"
-   "Travel-Taxis & Coach" "Transportation"})
+(defn initialize-db []
+  (sqlite/execute!
+   db-path
+   ["CREATE TABLE IF NOT EXISTS transactions (
+        id TEXT PRIMARY KEY,
+        date TEXT,
+        amount REAL,
+        name TEXT,
+        category TEXT,
+        account TEXT,
+        data TEXT
+        );"]))
 
-;; **Function to Detect File Type Based on Headers**
-(defn detect-file-type [headers]
-  (let [header-set (set headers)]
-    (cond
-      (contains? header-set "Transaction ID") :monzo
-      (contains? header-set "Appears On Your Statement As") :amex
-      :else :unknown)))
+;; NOTE: Does this get the name of the type properly? It's under the :name key
+(defn identify-csv-type [headers]
+  (some (fn [csv-type]
+          (let [id-cols (set (:identifier-columns csv-type))]
+            (when (every? (set headers) id-cols)
+              csv-type)))
+        (:csv-types config)))
 
-;; **Function to Normalize Date Strings to a Standard Format**
+;; NOTE: is this needed? Does it do anything?
 (defn normalize-date [date-str]
   (try
     (let [formatter (java.time.format.DateTimeFormatter/ofPattern "dd/MM/yyyy")
@@ -83,93 +82,102 @@
       (.format parsed-date
                (java.time.format.DateTimeFormatter/ofPattern "yyyy-MM-dd")))
     (catch Exception e
-      (println "Warning: Failed to parse date:" date-str)
+      (println "Warning: failed to parse date " date-str ": " (.getMessage e))
       nil)))
 
-;; **Function to Map Categories with Fallback**
-(defn map-category [source-category]
-  (if-let [mapped-category (get category-mapping source-category)]
-    mapped-category
-    (str "[" source-category "]")))
+;; NOTE: How to do for dynamic rules? For example for amex, negative amounts go
+;; to money in, positive amounts go to money out
+(defn apply-category-rules [transaction]
+  (let [name (:name transaction)
+        original-category (:original-category transaction)
+        amount (:amount transaction)]
+    (or
+     (some (fn [rule]
+             (let [{:keys [category match]} rule
+                   name-cond (if-let [sub (:name match)]
+                               (str/includes? name sub)
+                               true)
+                   amount-cond (if-let [amt (:amount match)]
+                                 (= amt amount)
+                                 true)
+                   orig-cat-cond (if-let [orig-cat (:original-category match)]
+                                   (= orig-cat original-category)
+                                   true)]
+               (when (and name-cond amount-cond orig-cat-cond)
+                 category)))
+           (:category-rules config))
+     (str "Uncategorized (" original-category ")"))))
 
-;; **Function to Process Monzo CSV Files**
-(defn process-monzo [rows]
-  (mapv (fn [row]
-          (let [money-in (get row "Money In")
-                money-out (get row "Money Out")
-                amount-str (or (not-empty money-in) (not-empty money-out))
-                amount (if amount-str (Double/parseDouble amount-str) 0.0)
-                ;; Map category with fallback
-                source-category (get row "Category")
-                mapped-category (map-category source-category)
-                date-str (get row "Date")
-                normalized-date (normalize-date date-str)]
-            {:date normalized-date
-             :amount amount
-             :name (get row "Name")
-             :category mapped-category
-             :account "monzo"}))
-        rows))
-
-;; **Function to Process Amex CSV Files**
-(defn process-amex [rows]
-  (mapv (fn [row]
-          (let [amount-str (get row "Amount")
-                amount (if (not-empty amount-str) (Double/parseDouble amount-str) 0.0)
-                amount (if (neg? amount) amount (- amount))
-                ;; Map category with fallback
-                source-category (get row "Category")
-                mapped-category (map-category source-category)
-                date-str (get row "Date")
-                normalized-date (normalize-date date-str)]
-            {:date normalized-date
-             :amount amount
-             :name (get row "Appears On Your Statement As")
-             :category mapped-category
-             :account "amex"}))
-        rows))
-
-;; **Main Processing Function**
-(defn process-file [file]
+(defn process-csv-file [file]
   (with-open [reader (io/reader file)]
     (let [data (doall (csv/read-csv reader))
           headers (first data)
-          rows (doall (map #(zipmap headers %) (rest data)))
-          file-type (detect-file-type headers)
-          processed-data (case file-type
-                            :monzo (process-monzo rows)
-                            :amex (process-amex rows)
-                            (do
-                              (println "Unknown file type for file:" file)
-                              []))]
-      processed-data)))
+          rows (rest data)
+          csv-type (identify-csv-type headers)]
+      (if csv-type
+        (let [column-mappings (:column-mappings csv-type)
+              account (:name csv-type)
+              required-cols (set (vals column-mappings))]
+          (doall
+           (map (fn [row]
+                  (let [row-map (zipmap headers row)
+                        transaction (reduce-kv
+                                     (fn [m csv-col internal-col]
+                                       (if internal-col
+                                         (assoc m internal-col (get row-map csv-col))
+                                         m))
+                                     {:account account}
+                                     column-mappings)
+                        amount-str (or (:money-in transaction) (:money-out transaction) (:amount transaction))
+                        amount (if amount-str (Double/parseDouble amount-str) 0.0)
+                        amount (cond
+                                 (:money-in transaction) amount
+                                 (:money-out transaction) amount
+                                 :else amount)
+                        date-str (:date transaction)
+                        normalized-date (normalize-date date-str)
+                        discarded-data (apply dissoc row-map (keys column-mappings))
+                        final-transaction (assoc transaction
+                                                 :date normalized-date
+                                                 :amount amount
+                                                 :category (apply-category-rules (assoc transaction :amount amount))
+                                                 :discarded-data (json/generate-string discarded-data))]
+                    final-transaction))
+                rows)))
+        (do
+          (println "Error: Could not identify CSV type for file" file)
+          [])))))
 
-;; **Collect Data from All Input Files**
-(defn collect-data [files]
-  (doall (mapcat process-file files)))
+(defn generate-transaction-id [transaction]
+  (hash/md5 (str (select-keys transaction [:date :amount :name :category :account]))))
 
-;; **Write Normalized Data to CSV**
-(defn write-csv [filename data]
-  (with-open [writer (io/writer filename)]
-    (let [headers ["Date" "Transaction Amount" "Name" "Category" "Account"]
-          sorted-data (sort-by :date data)
-          rows (mapv (fn [{:keys [date amount name category account]}]
-                       [date (format "%.2f" amount) name category account])
-                     sorted-data)]
-      (csv/write-csv writer [headers])
-      (csv/write-csv writer rows))))
+(defn insert-transactions [transactions]
+  (doseq [transaction transactions]
+    (let [id (generate-transaction-id transaction)
+          transaction (assoc transaction :id id)]
+      (try
+        (sqlite/execute!
+         db-path
+         ["INSERT INTO transactions (id, date, amount, name, category, account, data)
+           VALUES (?, ?, ?, ?, ?, ?, ?);"
+          (:id transaction)
+          (:date transaction)
+          (:amount transaction)
+          (:name transaction)
+          (:account transaction)
+          (:discared-data transaction)])
+        (catch Exception e
+          (println "Error inserting transaction" (:id transaction) ": " (.getMessage e)))))))
 
-;; **Entry Point**
+;; TODO: Better error handling. Which transactions failed to process?
 (defn -main [& args]
   (if (empty? args)
-    (println "Usage: script <input-file1> <input-file2> ...")
-    (let [files args
-          data (collect-data files)
-          today (.format (java.time.LocalDate/now)
-                         (java.time.format.DateTimeFormatter/ofPattern "yyyy-MM-dd"))
-          output-filename (str "normalized_expenses_" today ".csv")]
-      (write-csv output-filename data)
-      (println "Normalized data written to" output-filename))))
+    (println "Usage: money <input-file1> <input-file2> ...")
+    (do
+      (initialize-db)
+      (let [files args
+            transactions (mapcat process-csv-file files)]
+        (insert-transactions transactions)
+        (println "Processed" (count transactions) "transactions.")))))
 
-;; **Invoke Main Function with Command-Line Arguments**
 (apply -main *command-line-args*)
