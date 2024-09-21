@@ -1,16 +1,23 @@
-;; This file needs to be copied to $HOME/.config/money/config.edn
+;; This file needs to be copied to $HOME/.config/money/config.edn and adapted to
+;; suit your needs.
+
 {
+ ;; These are the different export types we can support.
  :csv-types
  [
   {
    :name "monzo"
+
+   ;; These are the column names we use to identify that this CSV file is a
+   ;; Monzo CSV file. If these columns are present, use this mapper.
    :identifier-columns ["Transaction ID" "Date" "Time"]
+
+   ;; Mapping CSV columns to our internal database columns.
    :column-mappings {
                      "Date" :date
                      "Name" :name
                      "Category" :original-category
-                     "Money Out" :amount
-                     "Money In" :amount
+                     "Amount" :amount
                      }
    }
   {
@@ -24,9 +31,72 @@
                      }
    }
   ]
+
+ ;; These rules describe how transactions are categorized. For now they only
+ ;; support matching on :name and on :original-category.
+ ;;
+ ;; :name is case insensitive and matches a substring.
+ ;; :original-category requires a strict match.
+ ;;
+ ;; You can combine both:
+ ;; {:match
+ ;;  {:name "blah"
+ ;;   :original-category "General"}
+ ;;  :category "Subscriptions"}
  :category-rules
  [
-  {:match {:name "Netflix" :amount 13.99} :category "Subscriptions"}
+  {:match {:name "APPLE.COM/BILL"} :category "Subscriptions"}
+  {:match {:name "YouTube Premium"} :category "Subscriptions"}
+  {:match {:name "NETFLIX.COM"} :category "Subscriptions"}
+
+  {:match {:original-category "Bills"} :category "Bills"}
+  {:match {:original-category "Income"} :category "Income"}
+  {:match {:original-category "Savings"} :category "Savings"}
+
+  {:match {:name "ringgo"} :category "Car"}
+  {:match {:name "CHAR.GY"} :category "Car"}
+  {:match {:original-category "General Purchases-Parking Charges"} :category "Car"}
+
+  {:match {:original-category "Eating out"} :category "Eating out"}
+  {:match {:original-category "Entertainment-Bars & Cafés"} :category "Eating out"}
+  {:match {:original-category "Entertainment-Restaurants"} :category "Eating out"}
+
+  {:match {:original-category "General"} :category "General"}
+
   {:match {:original-category "Groceries"} :category "Groceries"}
+  {:match {:original-category "General Purchases-Groceries"} :category "Groceries"}
+
+  {:match {:original-category "Holidays"} :category "Holidays"}
+
+  {:match {:original-category "Business Services-Health Care Services"} :category "Personal care"}
+  {:match {:original-category "General Purchases-Pharmacies"} :category "Personal care"}
+  {:match {:original-category "Personal care"} :category "Personal care"}
+  {:match {:name "yoga"} :category "Personal care"}
+
+  {:match {:original-category "Shopping"} :category "Shopping"}
+  {:match {:original-category "General Purchases-Book Stores"} :category "Shopping"}
+  {:match {:original-category "General Purchases-Clothing Stores"} :category "Shopping"}
+  {:match {:original-category "General Purchases-Department Stores"} :category "Shopping"}
+  {:match {:original-category "General Purchases-General Retail"} :category "Shopping"}
+  {:match {:original-category "General Purchases-Hardware Supplies"} :category "Shopping"}
+  {:match {:original-category "General Purchases-Online Purchases"} :category "Shopping"}
+  {:match {:original-category "General Purchases-Sporting Goods Stores"} :category "Shopping"}
+
+  {:match {:original-category "Transport"} :category "Transportation"}
+  {:match {:original-category "Travel-Airline"} :category "Transportation"}
+  {:match {:original-category "Travel-Auto Services"} :category "Transportation"}
+  {:match {:original-category "Travel-Other Travel"} :category "Transportation"}
+  {:match {:original-category "Travel-Taxis & Coach"} :category "Transportation"}
+
+  {:match {:original-category "Entertainment-Clubs"} :category "Entertainment"}
+  {:match {:original-category "Entertainment-General Attractions"} :category "Entertainment"}
+  {:match {:original-category "Entertainment-Other Entertainment"} :category "Entertainment"}
+  {:match {:original-category "Entertainment"} :category "Entertainment"}
+
+  {:match {:original-category "Transfers"} :category "Transfers"}
+
+  ;; This wildcard options is specific to amex, which doesn't set a description
+  ;; on transfers received to pay off card balance.
+  {:match {:original-category ""} :category "Transfers"}
   ]
  }
