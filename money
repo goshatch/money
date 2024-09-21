@@ -20,7 +20,6 @@
  '[clojure.string :as str]
  '[clojure.edn :as edn]
  '[babashka.pods :as pods]
- '[cheshire.core :as json]
  '[clojure.pprint :refer [pprint]])
 
 (import '[java.security MessageDigest])
@@ -127,7 +126,7 @@
                                                         :date normalized-date
                                                         :amount amount
                                                         :category (apply-category-rules transaction)
-                                                        :discarded-data (json/generate-string discarded-data))]
+                                                        :discarded-data (pr-str discarded-data))]
                            [final-transaction])
                          (catch Exception e
                            (println "Warning: Failed to process transaction in file" file "on row" (+ 1 idx))
