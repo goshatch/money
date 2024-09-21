@@ -7,14 +7,7 @@
 ;; 3. ???
 ;; 4. WEALTH AND PROFIT
 ;;
-;; TODO: Next steps
-;; - Store transactions in a sqlite database instead of outputting to csv
-;;   directly
-;; - Save a hash on each transaction to ensure we don't duplicate transactions
-;;   on csv import accidentally
-;; - Store configuration and custom mappings in a config file
-;;
-;; TODO: Later
+;; TODO: Roadmap
 ;; - Export data as csv from the sqlite database with custom ranges
 ;; - Automatically pull from Monzo/Amex/etc
 ;; - "How long will it take us to save x given current trends?"
@@ -61,12 +54,12 @@
         date TEXT,
         amount REAL,
         name TEXT,
+        original_category TEXT,
         category TEXT,
         account TEXT,
         data TEXT
         );"]))
 
-;; NOTE: Does this get the name of the type properly? It's under the :name key
 (defn identify-csv-type [headers]
   (some (fn [csv-type]
           (let [id-cols (set (:identifier-columns csv-type))]
@@ -74,7 +67,6 @@
               csv-type)))
         (:csv-types config)))
 
-;; NOTE: is this needed? Does it do anything?
 (defn normalize-date [date-str]
   (try
     (let [formatter (java.time.format.DateTimeFormatter/ofPattern "dd/MM/yyyy")
@@ -85,28 +77,22 @@
       (println "Warning: failed to parse date " date-str ": " (.getMessage e))
       nil)))
 
-;; NOTE: How to do for dynamic rules? For example for amex, negative amounts go
-;; to money in, positive amounts go to money out
 (defn apply-category-rules [transaction]
   (let [name (:name transaction)
-        original-category (:original-category transaction)
-        amount (:amount transaction)]
+        original-category (:original-category transaction)]
     (or
      (some (fn [rule]
              (let [{:keys [category match]} rule
                    name-cond (if-let [sub (:name match)]
-                               (str/includes? name sub)
+                               (str/includes? (str/lower-case name) (str/lower-case sub))
                                true)
-                   amount-cond (if-let [amt (:amount match)]
-                                 (= amt amount)
-                                 true)
                    orig-cat-cond (if-let [orig-cat (:original-category match)]
                                    (= orig-cat original-category)
                                    true)]
-               (when (and name-cond amount-cond orig-cat-cond)
+               (when (and name-cond orig-cat-cond)
                  category)))
            (:category-rules config))
-     (str "Uncategorized (" original-category ")"))))
+     nil)))
 
 (defn process-csv-file [file]
   (with-open [reader (io/reader file)]
@@ -140,7 +126,7 @@
                                final-transaction (assoc transaction
                                                         :date normalized-date
                                                         :amount amount
-                                                        :category (apply-category-rules (assoc transaction :amount amount))
+                                                        :category (apply-category-rules transaction)
                                                         :discarded-data (json/generate-string discarded-data))]
                            [final-transaction])
                          (catch Exception e
@@ -169,27 +155,53 @@
       (try
         (sqlite/execute!
          db-path
-         ["INSERT INTO transactions (id, date, amount, name, category, account, data)
-           VALUES (?, ?, ?, ?, ?, ?, ?);"
+         ["INSERT INTO transactions (id, date, amount, name, original_category, category, account, data)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?);"
           (:id transaction)
           (:date transaction)
           (:amount transaction)
           (:name transaction)
+          (:original-category transaction)
           (:category transaction)
           (:account transaction)
           (:discarded-data transaction)])
         (catch Exception e
           (println "Error inserting transaction" (:id transaction) ": " (.getMessage e)))))))
 
-;; TODO: Better error handling. Which transactions failed to process?
+(defn categorize-existing-transactions []
+  (let [transactions (sqlite/query
+                      db-path
+                      ["SELECT * FROM transactions WHERE category is NULL OR category = '';"])]
+    (doseq [transaction transactions]
+      (let [original-category (:original_category transaction)
+            updated-category (apply-category-rules (assoc transaction :original-category original-category))
+            updated-transaction (assoc transaction :category updated-category)]
+        (try
+          (sqlite/execute!
+           db-path
+           ["UPDATE transactions SET category = ? WHERE id = ?;"
+            (:category updated-transaction)
+            (:id updated-transaction)])
+          (println "Categorized transaction " (:id updated-transaction) "to" (:category updated-transaction))
+          (catch Exception e
+            (println "Error updating transaction" (:id updated-transaction) ":" (.getMessage e))))))))
+
 (defn -main [& args]
   (if (empty? args)
-    (println "Usage: money <input-file1> <input-file2> ...")
-    (do
+    (println "Usage: money [--categorize] <input-file1> <input-file2> ...")
+    (let [mode (first args)
+          files (if (= mode "--categorize") (rest args) args)]
       (initialize-db)
-      (let [files args
-            transactions (mapcat process-csv-file files)]
-        (insert-transactions transactions)
-        (println "Processed" (count transactions) "transactions.")))))
+      (cond
+        (= mode "--categorize")
+        (do
+          (categorize-existing-transactions)
+          (println "\nCategorization completed!"))
+
+        :else
+        (do
+          (let [transactions (mapcat process-csv-file files)]
+            (insert-transactions transactions)
+            (println "Processed" (count transactions) "transactions.")))))))
 
 (apply -main *command-line-args*)
